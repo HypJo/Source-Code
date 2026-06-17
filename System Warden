@@ -3,13 +3,12 @@ from __future__ import annotations
 import json
 import os
 import platform
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
-import time
-import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -17,52 +16,50 @@ import tkinter as tk
 from tkinter import ttk, messagebox, filedialog
 
 APP_NAME = "System Warden"
-APP_VERSION = "5.1"
+APP_VERSION = "1.2"
 IS_WINDOWS = platform.system() == "Windows"
 IS_MAC = platform.system() == "Darwin"
-
 APP_DIR = Path.home() / ".system_warden"
 VAULT_ROOT = APP_DIR / "BackupVault"
 HISTORY_FILE = APP_DIR / "history.jsonl"
 SETTINGS_FILE = APP_DIR / "settings.json"
 
-# Professional dark theme with gold/blue accents
-BG = "#0B1018"
-BG_2 = "#101824"
-PANEL = "#151F2D"
-PANEL_2 = "#1D2A3A"
-PANEL_3 = "#223246"
-BORDER = "#31445D"
-BORDER_DIM = "#26374D"
-TEXT = "#EAF0F7"
-TEXT_DIM = "#94A3B8"
-GOLD = "#D8A545"
-BLUE = "#2F80ED"
-CYAN = "#4FC3F7"
-GREEN = "#38B06D"
-RED = "#D94A4A"
-ORANGE = "#E6A23C"
-INPUT = "#0D1520"
+# 2026 dark professional palette
+BG = "#070B12"
+BG_2 = "#0B1220"
+PANEL = "#101A2B"
+PANEL_2 = "#162238"
+PANEL_3 = "#1B2A44"
+BORDER = "#273B5C"
+BORDER_2 = "#34527A"
+TEXT = "#EAF2FF"
+TEXT_DIM = "#91A4BD"
+MUTED = "#64748B"
+GOLD = "#D6A84F"
+BLUE = "#3B82F6"
+CYAN = "#38BDF8"
+GREEN = "#22C55E"
+RED = "#EF4444"
+ORANGE = "#F59E0B"
+INPUT = "#0A1322"
 
-FONT_TITLE = ("Segoe UI Semibold", 18)
+FONT_TITLE = ("Segoe UI Semibold", 22)
 FONT_H2 = ("Segoe UI Semibold", 14)
 FONT_UI = ("Segoe UI", 10)
-FONT_SMALL = ("Segoe UI", 9)
 FONT_BOLD = ("Segoe UI Semibold", 10)
+FONT_SMALL = ("Segoe UI", 9)
 FONT_MONO = ("Consolas", 9)
 
-@dataclass
+@dataclass(frozen=True)
 class Program:
     name: str
     version: str = ""
+    publisher: str = ""
     location: str = ""
     uninstall: str = ""
     source: str = ""
-
-
-def resource_path(name: str) -> Path:
-    base = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent))
-    return base / name
+    def row(self) -> str:
+        return self.name + (f"  v{self.version}" if self.version else "") + (f"  • {self.publisher}" if self.publisher else "")
 
 
 def ensure_dirs() -> None:
@@ -70,49 +67,46 @@ def ensure_dirs() -> None:
     VAULT_ROOT.mkdir(parents=True, exist_ok=True)
 
 
+def resource_path(name: str) -> Path:
+    return Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent)) / name
+
+
 def load_settings() -> dict:
     ensure_dirs()
-    defaults = {"create_restore_point": IS_WINDOWS, "backup_vault": True, "deep_scan_limit": 1500}
+    data = {"restore_point": IS_WINDOWS, "backup_vault": True, "deep_limit": 3000}
     if SETTINGS_FILE.exists():
-        try:
-            defaults.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
-        except Exception:
-            pass
-    return defaults
+        try: data.update(json.loads(SETTINGS_FILE.read_text(encoding="utf-8")))
+        except Exception: pass
+    return data
 
 
 def save_settings(data: dict) -> None:
-    ensure_dirs()
-    SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
+    ensure_dirs(); SETTINGS_FILE.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
 
-def append_history(entry: dict) -> None:
+def history(entry: dict) -> None:
     ensure_dirs()
     entry = {"time": datetime.now().isoformat(timespec="seconds"), **entry}
     with HISTORY_FILE.open("a", encoding="utf-8") as f:
         f.write(json.dumps(entry, ensure_ascii=False) + "\n")
 
 
-def read_history(limit: int = 300) -> list[dict]:
-    if not HISTORY_FILE.exists():
-        return []
-    out = []
-    with HISTORY_FILE.open("r", encoding="utf-8", errors="ignore") as f:
-        for line in f:
-            try:
-                out.append(json.loads(line))
-            except Exception:
-                pass
-    return out[-limit:][::-1]
+def read_history(limit: int = 500) -> list[dict]:
+    if not HISTORY_FILE.exists(): return []
+    rows = []
+    for line in HISTORY_FILE.read_text(encoding="utf-8", errors="ignore").splitlines():
+        try: rows.append(json.loads(line))
+        except Exception: pass
+    return rows[-limit:][::-1]
 
 
-def format_size(size: int | float) -> str:
+def format_size(n: int | float) -> str:
     try:
-        size = float(size)
+        n = float(n)
         for unit in ("B", "KB", "MB", "GB", "TB"):
-            if size < 1024 or unit == "TB":
-                return f"{size:.1f} {unit}" if unit != "B" else f"{int(size)} B"
-            size /= 1024
+            if n < 1024 or unit == "TB":
+                return f"{int(n)} B" if unit == "B" else f"{n:.1f} {unit}"
+            n /= 1024
     except Exception:
         return "0 B"
 
@@ -120,699 +114,520 @@ def format_size(size: int | float) -> str:
 def path_size(path: str | Path) -> int:
     p = Path(path)
     try:
-        if p.is_file() or p.is_symlink():
-            return p.stat().st_size
+        if p.is_file() or p.is_symlink(): return p.stat().st_size
         total = 0
         for root, _dirs, files in os.walk(p):
             for f in files:
-                try:
-                    total += (Path(root) / f).stat().st_size
-                except OSError:
-                    pass
+                try: total += (Path(root) / f).stat().st_size
+                except OSError: pass
         return total
     except Exception:
         return 0
 
 
+def normalize_path(raw: str) -> str:
+    raw = os.path.expandvars((raw or "").strip().strip('"'))
+    raw = re.sub(r",\s*\d+$", "", raw).replace("%1", "").strip().strip('"')
+    p = Path(raw)
+    if p.exists(): return str(p)
+    return ""
+
+
 def discover_programs() -> list[Program]:
-    if IS_WINDOWS:
-        return discover_windows()
-    if IS_MAC:
-        return discover_mac()
+    if IS_WINDOWS: return discover_windows()
+    if IS_MAC: return discover_mac()
     return discover_linux()
 
 
 def discover_windows() -> list[Program]:
     import winreg
-    found = {}
+    found: dict[str, Program] = {}
     roots = [
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
         (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall"),
         (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
     ]
-    for hive, key_path in roots:
+    for hive, reg_path in roots:
+        try: key = winreg.OpenKey(hive, reg_path)
+        except OSError: continue
         try:
-            key = winreg.OpenKey(hive, key_path)
-        except OSError:
-            continue
-        try:
-            count = winreg.QueryInfoKey(key)[0]
-            for i in range(count):
+            for i in range(winreg.QueryInfoKey(key)[0]):
                 try:
-                    sub = winreg.EnumKey(key, i)
-                    sk = winreg.OpenKey(key, sub)
-                except OSError:
-                    continue
+                    sub = winreg.OpenKey(key, winreg.EnumKey(key, i))
+                except OSError: continue
                 def val(name: str) -> str:
-                    try:
-                        return str(winreg.QueryValueEx(sk, name)[0])
-                    except OSError:
-                        return ""
-                name = val("DisplayName").strip()
-                if not name:
-                    continue
-                found[name.lower()] = Program(name, val("DisplayVersion"), val("InstallLocation"), val("UninstallString"), "registry")
+                    try: return str(winreg.QueryValueEx(sub, name)[0]).strip()
+                    except OSError: return ""
+                name = val("DisplayName")
+                if not name: continue
+                if val("SystemComponent") == "1" or val("ReleaseType").lower() == "update": continue
+                loc = val("InstallLocation")
+                if not loc:
+                    icon = normalize_path(val("DisplayIcon"))
+                    if icon: loc = str(Path(icon).parent if Path(icon).is_file() else Path(icon))
+                found[name.lower()] = Program(name, val("DisplayVersion"), val("Publisher"), loc, val("UninstallString"), "Windows Registry")
         finally:
-            try:
-                winreg.CloseKey(key)
-            except Exception:
-                pass
+            try: winreg.CloseKey(key)
+            except Exception: pass
     return sorted(found.values(), key=lambda p: p.name.lower())
 
 
 def discover_mac() -> list[Program]:
-    apps = []
-    for base in (Path("/Applications"), Path.home() / "Applications"):
-        if not base.exists():
-            continue
-        for item in base.iterdir():
-            if item.suffix == ".app":
-                apps.append(Program(item.stem, location=str(item), source="app_bundle"))
+    apps=[]
+    for base in (Path('/Applications'), Path.home()/'Applications'):
+        if base.exists():
+            for app in base.glob('*.app'): apps.append(Program(app.stem, location=str(app), source='Application Bundle'))
     return sorted(apps, key=lambda p: p.name.lower())
 
 
 def discover_linux() -> list[Program]:
-    apps = {}
-    for d in (Path("/usr/share/applications"), Path("/usr/local/share/applications"), Path.home()/".local/share/applications"):
-        if not d.exists():
-            continue
-        for file in d.glob("*.desktop"):
-            name, loc = file.stem, str(file)
+    apps={}
+    for d in (Path('/usr/share/applications'), Path('/usr/local/share/applications'), Path.home()/'.local/share/applications'):
+        if not d.exists(): continue
+        for file in d.glob('*.desktop'):
+            name=file.stem; loc=str(file)
             try:
-                for line in file.read_text(errors="ignore").splitlines():
-                    if line.startswith("Name="):
-                        name = line.split("=",1)[1].strip()
-                    elif line.startswith("Exec="):
-                        loc = line.split("=",1)[1].strip()
-            except Exception:
-                pass
-            apps[name.lower()] = Program(name, location=loc, source="desktop")
+                for line in file.read_text(errors='ignore').splitlines():
+                    if line.startswith('Name='): name=line.split('=',1)[1].strip() or name
+                    if line.startswith('Exec='): loc=line.split('=',1)[1].strip()
+            except Exception: pass
+            apps[name.lower()]=Program(name, location=loc, source='Desktop Entry')
     return sorted(apps.values(), key=lambda p: p.name.lower())
 
 
-def scan_associated_paths(program: Program, deep: bool=False, limit: int=1500) -> list[str]:
-    paths: list[str] = []
-    loc = program.location.strip().strip('"')
-    if loc and Path(loc).exists():
-        paths.append(str(Path(loc)))
-    tokens = [t for t in program.name.replace("("," ").replace(")"," ").replace("-"," ").split() if len(t) > 2]
-    needles = {program.name.lower()}
-    needles.update(t.lower() for t in tokens[:3])
-    roots: list[Path] = []
+def needles(program: Program | str) -> list[str]:
+    text = program if isinstance(program, str) else f"{program.name} {program.publisher}"
+    parts = re.findall(r"[a-z0-9]{3,}", text.lower())
+    blocked = {"the", "and", "for", "with", "app", "application", "setup", "installer", "update", "microsoft", "windows"}
+    out=[]
+    for p in parts:
+        if p not in blocked and p not in out: out.append(p)
+    return out[:4]
+
+
+def scan_associated_paths(program: Program | str, deep: bool=False, limit: int=3000) -> list[str]:
+    out=[]; seen=set()
+    if isinstance(program, Program) and program.location:
+        loc = normalize_path(program.location)
+        if loc: out.append(loc); seen.add(loc)
+    roots=[]
     if IS_WINDOWS:
         for env in ("PROGRAMFILES", "PROGRAMFILES(X86)", "PROGRAMDATA", "LOCALAPPDATA", "APPDATA"):
-            v = os.environ.get(env)
-            if v:
-                roots.append(Path(v))
+            v=os.environ.get(env)
+            if v: roots.append(Path(v))
     else:
-        roots += [Path.home()/".config", Path.home()/".local/share"]
-        if IS_MAC:
-            roots.append(Path.home()/"Library/Application Support")
-    seen = set(map(str, paths))
+        roots=[Path.home()/'.config', Path.home()/'.local/share']
+        if IS_MAC: roots.append(Path.home()/'Library/Application Support')
+    ns = needles(program)
     for root in roots:
-        if not root.exists():
-            continue
+        if not root.exists(): continue
         try:
-            iterator = root.rglob("*") if deep else root.iterdir()
-            checked = 0
-            for entry in iterator:
+            iterator = root.rglob('*') if deep else root.iterdir()
+            checked=0
+            for e in iterator:
                 checked += 1
-                if checked > limit and deep:
-                    break
-                low = entry.name.lower()
-                if any(n and n in low for n in needles):
-                    s = str(entry)
-                    if s not in seen:
-                        seen.add(s); paths.append(s)
-        except Exception:
-            continue
-    return paths
-
-
-def get_temp_items() -> list[str]:
-    roots = [Path(tempfile.gettempdir())]
-    if IS_WINDOWS:
-        for env in ("TEMP", "TMP"):
-            v = os.environ.get(env)
-            if v:
-                roots.append(Path(v))
-    out = []
-    seen = set()
-    for root in roots:
-        if not root.exists():
-            continue
-        try:
-            for entry in root.iterdir():
-                s = str(entry)
-                if s not in seen:
-                    seen.add(s); out.append(s)
-        except Exception:
-            pass
+                if deep and checked > limit: break
+                name=e.name.lower()
+                if any(n in name for n in ns):
+                    s=str(e)
+                    if s not in seen: seen.add(s); out.append(s)
+        except Exception: continue
     return out
 
 
-def create_restore_point(description: str) -> tuple[bool, str]:
-    if not IS_WINDOWS:
-        return False, "Restore points are Windows-only."
-    cmd = ["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", f"Checkpoint-Computer -Description '{description}' -RestorePointType 'MODIFY_SETTINGS'"]
+def temp_items() -> list[str]:
+    roots=[Path(tempfile.gettempdir())]
+    if IS_WINDOWS:
+        for env in ('TEMP','TMP'):
+            v=os.environ.get(env)
+            if v: roots.append(Path(v))
+    out=[]; seen=set()
+    for root in roots:
+        if not root.exists(): continue
+        try:
+            for e in root.iterdir():
+                s=str(e)
+                if s not in seen: seen.add(s); out.append(s)
+        except Exception: pass
+    return out
+
+
+def clean_restore_message(raw: str) -> str:
+    text = (raw or "").lower()
+    if "access denied" in text or "unauthorized" in text:
+        return "Restore point skipped: administrator permission required. Cleanup can continue with Backup Vault protection."
+    if "disable" in text or "turned off" in text or "system protection" in text:
+        return "Restore point skipped: Windows System Protection appears to be disabled."
+    if raw and len(raw) < 160: return raw.strip()
+    return "Restore point failed. Run as administrator and confirm System Protection is enabled."
+
+
+def create_restore_point() -> tuple[bool, str]:
+    if not IS_WINDOWS: return False, "Restore points are Windows-only."
+    cmd=["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", "Checkpoint-Computer -Description 'System Warden cleanup' -RestorePointType 'MODIFY_SETTINGS'"]
     try:
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
-        if result.returncode == 0:
-            return True, "Windows restore point created."
-        msg = (result.stderr or result.stdout or "Unknown PowerShell error").strip()
-        return False, msg
+        p=subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        if p.returncode == 0: return True, "Restore point created."
+        return False, clean_restore_message(p.stderr or p.stdout)
     except Exception as exc:
-        return False, str(exc)
+        return False, clean_restore_message(str(exc))
 
 
 def backup_paths(paths: list[str]) -> tuple[Path | None, str]:
-    ensure_dirs()
-    stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    vault = VAULT_ROOT / stamp
-    vault.mkdir(parents=True, exist_ok=True)
-    meta = {"created": datetime.now().isoformat(timespec="seconds"), "items": []}
+    ensure_dirs(); stamp=datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
+    vault=VAULT_ROOT/stamp; (vault/'files').mkdir(parents=True, exist_ok=True)
+    meta={"created": datetime.now().isoformat(timespec='seconds'), "items": []}
+    ok=0
     for src in paths:
-        p = Path(src)
-        if not p.exists():
-            continue
-        safe = p.drive.replace(":", "") if p.drive else "root"
-        rel_parts = [part for part in p.parts if part not in (p.anchor, p.drive, "\\", "/")]
-        dest = vault / "files" / safe / Path(*rel_parts)
+        p=Path(src)
+        if not p.exists(): continue
+        drive=(p.drive.replace(':','') if p.drive else 'root')
+        parts=[x for x in p.parts if x not in (p.anchor, p.drive, '/', '\\')]
+        dest=vault/'files'/drive/Path(*parts)
         try:
             dest.parent.mkdir(parents=True, exist_ok=True)
-            if p.is_dir() and not p.is_symlink():
-                shutil.copytree(p, dest, dirs_exist_ok=True)
-            else:
-                shutil.copy2(p, dest)
-            meta["items"].append({"source": str(p), "backup": str(dest), "size": path_size(p)})
+            if p.is_dir() and not p.is_symlink(): shutil.copytree(p, dest, dirs_exist_ok=True)
+            else: shutil.copy2(p, dest)
+            meta['items'].append({'source': str(p), 'backup': str(dest), 'size': path_size(p)}); ok += 1
         except Exception as exc:
-            meta["items"].append({"source": str(p), "error": str(exc), "size": path_size(p)})
-    (vault / "metadata.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-    return vault, f"Backed up {len([i for i in meta['items'] if 'backup' in i])} item(s)."
+            meta['items'].append({'source': str(p), 'error': str(exc), 'size': path_size(p)})
+    (vault/'metadata.json').write_text(json.dumps(meta, indent=2), encoding='utf-8')
+    return vault, f"Backup Vault saved {ok} item(s)."
 
 
 def delete_path(path: str) -> tuple[bool, str]:
-    p = Path(path)
+    p=Path(path)
     try:
-        if p.is_dir() and not p.is_symlink():
-            shutil.rmtree(p)
-        else:
-            p.unlink()
+        if p.is_dir() and not p.is_symlink(): shutil.rmtree(p)
+        else: p.unlink()
         return True, f"Removed: {p}"
     except Exception as exc:
         return False, f"Failed: {p} — {exc}"
 
 
 def restore_vault(vault: Path) -> tuple[int, int, list[str]]:
-    meta_file = vault / "metadata.json"
-    if not meta_file.exists():
-        return 0, 0, ["metadata.json not found"]
-    meta = json.loads(meta_file.read_text(encoding="utf-8"))
-    ok = fail = 0; notes=[]
-    for item in meta.get("items", []):
-        src = Path(item.get("source", "")); bak = Path(item.get("backup", ""))
-        if not bak.exists():
-            fail += 1; notes.append(f"Missing backup: {bak}"); continue
-        if src.exists():
-            notes.append(f"Skipped existing: {src}"); continue
+    try: meta=json.loads((vault/'metadata.json').read_text(encoding='utf-8'))
+    except Exception: return 0,1,["metadata.json not found"]
+    ok=fail=0; notes=[]
+    for item in meta.get('items', []):
+        src=Path(item.get('source','')); bak=Path(item.get('backup',''))
+        if not bak.exists(): fail+=1; notes.append(f"Missing backup: {bak}"); continue
+        if src.exists(): notes.append(f"Skipped existing: {src}"); continue
         try:
             src.parent.mkdir(parents=True, exist_ok=True)
-            if bak.is_dir():
-                shutil.copytree(bak, src)
-            else:
-                shutil.copy2(bak, src)
+            if bak.is_dir(): shutil.copytree(bak, src)
+            else: shutil.copy2(bak, src)
             ok += 1
-        except Exception as exc:
-            fail += 1; notes.append(f"Failed {src}: {exc}")
+        except Exception as exc: fail += 1; notes.append(f"Failed {src}: {exc}")
     return ok, fail, notes
-
 
 class SystemWarden(tk.Tk):
     def __init__(self):
-        super().__init__()
-        ensure_dirs()
-        self.settings = load_settings()
-        super().title(APP_NAME)
-        self.geometry("1180x760")
-        self.minsize(1040, 680)
-        self.configure(bg=BG)
-        self._load_icon()
-        self._style()
+        super().__init__(); ensure_dirs()
+        self.title(APP_NAME); self.geometry('1200x780'); self.minsize(1060,680); self.configure(bg=BG)
+        self.settings=load_settings(); self.programs=[]; self.filtered=[]; self.queue=[]; self.current_page='Dashboard'
+        self.restore_var=tk.BooleanVar(value=bool(self.settings.get('restore_point', IS_WINDOWS)))
+        self.vault_var=tk.BooleanVar(value=bool(self.settings.get('backup_vault', True)))
+        self.deep_limit_var=tk.StringVar(value=str(self.settings.get('deep_limit', 3000)))
+        self._load_icon(); self._style(); self._shell(); self.show_dashboard(); self.refresh_programs()
 
-        self.programs: list[Program] = []
-        self.filtered: list[Program] = []
-        self.scan_items: list[tuple[str, tk.BooleanVar, int]] = []
-        self.active_page = "Dashboard"
-        self.create_restore_var = tk.BooleanVar(value=bool(self.settings.get("create_restore_point", IS_WINDOWS)))
-        self.backup_vault_var = tk.BooleanVar(value=bool(self.settings.get("backup_vault", True)))
-
-        self._build_shell()
-        self.show_dashboard()
-        self.refresh_programs()
-
-    def _load_icon(self) -> None:
+    def _load_icon(self):
         try:
-            ico = resource_path("SystemWarden.ico")
-            if ico.exists():
-                self.iconbitmap(default=str(ico))
-        except Exception:
-            pass
-        try:
-            png = resource_path("SystemWarden_icon.png")
-            if png.exists():
-                self._icon_img = tk.PhotoImage(file=str(png))
-                self.iconphoto(True, self._icon_img)
-        except Exception:
-            pass
-
-    def _style(self) -> None:
-        style = ttk.Style(self)
-        try: style.theme_use("clam")
+            ico=resource_path('SystemWarden.ico')
+            if ico.exists(): self.iconbitmap(str(ico))
         except Exception: pass
-        style.configure("Treeview", background=BG_2, foreground=TEXT, fieldbackground=BG_2, rowheight=26, bordercolor=BORDER, font=FONT_SMALL)
-        style.configure("Treeview.Heading", background=PANEL_3, foreground=TEXT, font=FONT_BOLD)
-        style.map("Treeview", background=[("selected", BLUE)], foreground=[("selected", "white")])
-        style.configure("Vertical.TScrollbar", background=PANEL_2, troughcolor=BG_2, bordercolor=BORDER, arrowcolor=TEXT)
+        try:
+            png=resource_path('SystemWarden_icon.png')
+            if png.exists(): self._icon=tk.PhotoImage(file=str(png)); self.iconphoto(True, self._icon)
+        except Exception: pass
 
-    def _build_shell(self) -> None:
-        self.header = tk.Frame(self, bg=BG, height=72)
-        self.header.pack(fill="x", padx=14, pady=(14, 8))
-        self.header.pack_propagate(False)
-        hcard = tk.Frame(self.header, bg=PANEL, highlightbackground=BORDER_DIM, highlightthickness=1)
-        hcard.pack(fill="both", expand=True)
-        tk.Label(hcard, text="System Warden", bg=PANEL, fg=TEXT, font=("Segoe UI Semibold", 19)).pack(side="left", padx=(18, 10))
-        tk.Label(hcard, text="Professional cleanup, uninstall leftovers, backup vault, and restore protection", bg=PANEL, fg=TEXT_DIM, font=FONT_UI).pack(side="left")
-        self.status_var = tk.StringVar(value="Ready")
-        tk.Label(hcard, textvariable=self.status_var, bg=PANEL, fg=CYAN, font=FONT_SMALL).pack(side="right", padx=18)
+    def _style(self):
+        s=ttk.Style(self)
+        try: s.theme_use('clam')
+        except Exception: pass
+        s.configure('Treeview', background=BG_2, foreground=TEXT, fieldbackground=BG_2, rowheight=28, bordercolor=BORDER, font=FONT_SMALL)
+        s.configure('Treeview.Heading', background=PANEL_3, foreground=TEXT, font=FONT_BOLD)
+        s.map('Treeview', background=[('selected', BLUE)], foreground=[('selected', 'white')])
+        s.configure('Vertical.TScrollbar', background=PANEL_2, troughcolor=BG_2, bordercolor=BORDER, arrowcolor=TEXT)
 
-        body = tk.Frame(self, bg=BG)
-        body.pack(fill="both", expand=True, padx=14, pady=(0, 10))
+    def _shell(self):
+        header=tk.Frame(self,bg=BG); header.pack(fill='x', padx=16, pady=(16,10))
+        hero=tk.Frame(header,bg=PANEL,highlightbackground=BORDER,highlightthickness=1); hero.pack(fill='x')
+        tk.Label(hero,text='System Warden',bg=PANEL,fg=TEXT,font=("Segoe UI Semibold",24)).pack(side='left',padx=(20,10),pady=16)
+        tk.Label(hero,text='v1.2 • modern cleanup, review-first deletion, vault protection',bg=PANEL,fg=TEXT_DIM,font=FONT_UI).pack(side='left')
+        self.status=tk.StringVar(value='Ready')
+        self.status_lbl=tk.Label(hero,textvariable=self.status,bg=PANEL_2,fg=CYAN,font=FONT_SMALL,padx=12,pady=6)
+        self.status_lbl.pack(side='right',padx=16)
+        body=tk.Frame(self,bg=BG); body.pack(fill='both',expand=True,padx=16,pady=(0,12))
+        self.sidebar=tk.Frame(body,bg=PANEL, width=214, highlightbackground=BORDER, highlightthickness=1)
+        self.sidebar.pack(side='left',fill='y',padx=(0,12)); self.sidebar.pack_propagate(False)
+        tk.Label(self.sidebar,text='COMMAND CENTER',bg=PANEL,fg=GOLD,font=("Segoe UI Semibold",13)).pack(anchor='w',padx=16,pady=(18,2))
+        tk.Label(self.sidebar,text='System utility console',bg=PANEL,fg=TEXT_DIM,font=FONT_SMALL).pack(anchor='w',padx=16,pady=(0,14))
+        self.nav={}
+        for name, fn in [('Dashboard',self.show_dashboard),('Programs',self.show_programs),('Hunter',self.show_hunter),('Vault',self.show_vault),('History',self.show_history),('Settings',self.show_settings)]:
+            self.nav[name]=self._nav(name, fn)
+        tk.Frame(self.sidebar,bg=PANEL).pack(fill='both',expand=True)
+        self._side('Open Vault', self.open_vault).pack(fill='x',padx=12,pady=(0,6))
+        self._side('Safety Notes', self.show_safety).pack(fill='x',padx=12,pady=(0,14))
+        right=tk.Frame(body,bg=BG); right.pack(side='left',fill='both',expand=True)
+        self.content=tk.Frame(right,bg=BG); self.content.pack(fill='both',expand=True)
+        self.log=tk.Text(right,height=5,bg=BG_2,fg=GREEN,font=FONT_MONO,bd=0,highlightthickness=1,highlightbackground=BORDER,state='disabled')
+        self.log.pack(fill='x',pady=(10,0)); self.log_msg('System Warden loaded.', CYAN)
 
-        self.sidebar = tk.Frame(body, bg=PANEL, width=210, highlightbackground=BORDER_DIM, highlightthickness=1)
-        self.sidebar.pack(side="left", fill="y", padx=(0, 10))
-        self.sidebar.pack_propagate(False)
-        tk.Label(self.sidebar, text="WARDEN", bg=PANEL, fg=GOLD, font=("Segoe UI Semibold", 16)).pack(anchor="w", padx=16, pady=(18, 6))
-        tk.Label(self.sidebar, text="Utility Console", bg=PANEL, fg=TEXT_DIM, font=FONT_SMALL).pack(anchor="w", padx=16, pady=(0, 12))
-        self.nav_buttons = {}
-        for name, cmd in (
-            ("Dashboard", self.show_dashboard), ("Programs", self.show_programs), ("Hunter", self.show_hunter),
-            ("Vault", self.show_vault), ("History", self.show_history), ("Settings", self.show_settings),
-        ):
-            self.nav_buttons[name] = self._nav_button(name, cmd)
-        tk.Frame(self.sidebar, bg=PANEL).pack(fill="both", expand=True)
-        self._side_action("Rescan Apps", self.refresh_programs)
-        self._side_action("Safety Notes", self.show_safety)
+    def btn(self,parent,text,cmd,bg=PANEL_2,fg=TEXT):
+        return tk.Button(parent,text=text,command=cmd,bg=bg,fg=fg,activebackground=BLUE,activeforeground='white',relief='flat',bd=0,font=FONT_BOLD,cursor='hand2',padx=12,pady=8)
+    def _nav(self,text,cmd):
+        b=self.btn(self.sidebar, '  '+text, cmd, PANEL_2, TEXT); b.configure(anchor='w'); b.pack(fill='x',padx=12,pady=4); return b
+    def _side(self,text,cmd): return self.btn(self.sidebar,text,cmd,BG_2,TEXT_DIM)
+    def card(self,parent,**pack):
+        f=tk.Frame(parent,bg=PANEL,highlightbackground=BORDER,highlightthickness=1); f.pack(**pack); return f
+    def set_page(self,name):
+        self.current_page=name
+        for k,b in self.nav.items(): b.configure(bg=BLUE if k==name else PANEL_2, fg='white' if k==name else TEXT)
+        for w in self.content.winfo_children(): w.destroy()
+    def title_block(self,title,sub=''):
+        tk.Label(self.content,text=title,bg=BG,fg=TEXT,font=FONT_TITLE).pack(anchor='w')
+        if sub: tk.Label(self.content,text=sub,bg=BG,fg=TEXT_DIM,font=FONT_UI).pack(anchor='w',pady=(2,12))
+    def status_set(self,msg,color=CYAN):
+        one=str(msg).replace('\r',' ').splitlines()[0][:95]
+        self.status.set(one); self.status_lbl.configure(fg=color)
+    def log_msg(self,msg,color=GREEN):
+        self.status_set(msg,color); self.log.configure(state='normal'); self.log.insert('end',str(msg)+'\n')
+        tag='t'+color; self.log.tag_add(tag,'end-2l','end-1l'); self.log.tag_config(tag,foreground=color); self.log.see('end'); self.log.configure(state='disabled')
 
-        right = tk.Frame(body, bg=BG)
-        right.pack(side="left", fill="both", expand=True)
-        self.content = tk.Frame(right, bg=BG)
-        self.content.pack(fill="both", expand=True)
-        self.log = tk.Text(right, height=5, bg=BG_2, fg=GREEN, font=FONT_MONO, bd=0, highlightthickness=1, highlightbackground=BORDER_DIM, state="disabled")
-        self.log.pack(fill="x", pady=(10,0))
-        self._log("System Warden loaded. Use the sidebar to switch pages.", CYAN)
+    def metric(self,parent,label,value,col):
+        f=tk.Frame(parent,bg=PANEL,highlightbackground=BORDER,highlightthickness=1); f.grid(row=0,column=col,sticky='ew',padx=(0 if col==0 else 8,0)); parent.grid_columnconfigure(col,weight=1)
+        tk.Label(f,text=label,bg=PANEL,fg=TEXT_DIM,font=FONT_SMALL).pack(anchor='w',padx=14,pady=(12,0))
+        tk.Label(f,text=value,bg=PANEL,fg=GOLD,font=("Segoe UI Semibold",22)).pack(anchor='w',padx=14,pady=(0,12))
 
-    def _nav_button(self, text, command):
-        b = tk.Button(self.sidebar, text=f"  {text}", command=command, bg=PANEL_2, fg=TEXT, activebackground=BLUE,
-                      activeforeground="white", relief="flat", bd=0, font=FONT_BOLD, anchor="w", cursor="hand2", padx=10, pady=10)
-        b.pack(fill="x", padx=12, pady=4)
-        return b
-
-    def _side_action(self, text, command):
-        b = tk.Button(self.sidebar, text=text, command=command, bg=BG_2, fg=TEXT_DIM, activebackground=PANEL_3,
-                      activeforeground=TEXT, relief="flat", bd=0, font=FONT_SMALL, cursor="hand2", pady=7)
-        b.pack(fill="x", padx=12, pady=(0, 6))
-        return b
-
-    def set_page(self, name: str):
-        self.active_page = name
-        for n, b in self.nav_buttons.items():
-            b.configure(bg=BLUE if n == name else PANEL_2, fg="white" if n == name else TEXT)
-        for w in self.content.winfo_children():
-            w.destroy()
-
-    def _log(self, msg: str, color=GREEN):
-        self.status_var.set(msg)
-        self.log.configure(state="normal")
-        self.log.insert("end", msg + "\n")
-        tag = f"c{color}"
-        self.log.tag_add(tag, "end-2l", "end-1l")
-        self.log.tag_config(tag, foreground=color)
-        self.log.see("end")
-        self.log.configure(state="disabled")
-
-    def card(self, parent, **pack):
-        f = tk.Frame(parent, bg=PANEL, highlightbackground=BORDER_DIM, highlightthickness=1)
-        f.pack(**pack)
-        return f
-
-    def button(self, parent, text, command, bg=PANEL_2, fg=TEXT):
-        return tk.Button(parent, text=text, command=command, bg=bg, fg=fg, activebackground=BLUE, activeforeground="white",
-                         relief="flat", bd=0, font=FONT_BOLD, cursor="hand2", padx=12, pady=8)
-
-    def page_title(self, parent, text, sub=""):
-        tk.Label(parent, text=text, bg=BG, fg=TEXT, font=FONT_TITLE).pack(anchor="w")
-        if sub: tk.Label(parent, text=sub, bg=BG, fg=TEXT_DIM, font=FONT_UI).pack(anchor="w", pady=(2,12))
-
-    # Pages
     def show_dashboard(self):
-        self.set_page("Dashboard")
-        self.page_title(self.content, "Dashboard", "System overview and quick actions.")
-        grid = tk.Frame(self.content, bg=BG); grid.pack(fill="x")
-        self.metric(grid, "Installed Apps", str(len(self.programs)), 0, 0)
-        self.metric(grid, "Vault Backups", str(len(self.get_vaults())), 0, 1)
-        self.metric(grid, "History Entries", str(len(read_history(9999))), 0, 2)
-        self.metric(grid, "Backup Vault", "Enabled" if self.backup_vault_var.get() else "Off", 0, 3)
-        actions = self.card(self.content, fill="x", pady=(12,0))
-        tk.Label(actions, text="Quick Actions", bg=PANEL, fg=GOLD, font=FONT_H2).pack(anchor="w", padx=14, pady=(14,8))
-        row = tk.Frame(actions, bg=PANEL); row.pack(fill="x", padx=14, pady=(0,14))
-        self.button(row, "Scan Temp Junk", self.scan_temp_junk, bg=GREEN, fg=BG).pack(side="left", padx=(0,8))
-        self.button(row, "Open Programs", self.show_programs).pack(side="left", padx=8)
-        self.button(row, "Open Vault", self.show_vault).pack(side="left", padx=8)
-        self.button(row, "Export Report", self.export_report).pack(side="left", padx=8)
-        info = self.card(self.content, fill="both", expand=True, pady=(12,0))
-        tk.Label(info, text="Protection Status", bg=PANEL, fg=GOLD, font=FONT_H2).pack(anchor="w", padx=14, pady=(14,8))
-        txt = "Restore Point: " + ("Enabled" if self.create_restore_var.get() else "Disabled") + "\n"
-        txt += "Backup Vault: " + ("Enabled" if self.backup_vault_var.get() else "Disabled") + f"\nVault Path: {VAULT_ROOT}"
-        tk.Label(info, text=txt, bg=PANEL, fg=TEXT_DIM, font=FONT_UI, justify="left").pack(anchor="w", padx=14)
-
-    def metric(self, parent, label, value, r, c):
-        f = tk.Frame(parent, bg=PANEL, highlightbackground=BORDER_DIM, highlightthickness=1)
-        f.grid(row=r, column=c, sticky="ew", padx=(0 if c==0 else 8,0), pady=0)
-        parent.grid_columnconfigure(c, weight=1)
-        tk.Label(f, text=label, bg=PANEL, fg=TEXT_DIM, font=FONT_SMALL).pack(anchor="w", padx=14, pady=(12,0))
-        tk.Label(f, text=value, bg=PANEL, fg=GOLD, font=("Segoe UI Semibold", 22)).pack(anchor="w", padx=14, pady=(2,12))
+        self.set_page('Dashboard'); self.title_block('Dashboard','System overview and quick actions.')
+        grid=tk.Frame(self.content,bg=BG); grid.pack(fill='x')
+        self.metric(grid,'Installed Apps',str(len(self.programs)),0); self.metric(grid,'Vault Backups',str(len(self.get_vaults())),1); self.metric(grid,'History Entries',str(len(read_history(9999))),2); self.metric(grid,'Protection','On' if self.vault_var.get() else 'Off',3)
+        c=self.card(self.content,fill='x',pady=(12,0)); tk.Label(c,text='Quick Actions',bg=PANEL,fg=GOLD,font=FONT_H2).pack(anchor='w',padx=14,pady=(14,8))
+        r=tk.Frame(c,bg=PANEL); r.pack(fill='x',padx=14,pady=(0,14))
+        self.btn(r,'Open Programs',self.show_programs,BLUE).pack(side='left',padx=(0,8)); self.btn(r,'Temp Hunter',self.scan_temp_junk,GREEN,BG).pack(side='left',padx=8); self.btn(r,'Open Vault',self.show_vault).pack(side='left',padx=8); self.btn(r,'Export Report',self.export_report).pack(side='left',padx=8)
+        info=self.card(self.content,fill='both',expand=True,pady=(12,0)); tk.Label(info,text='Safety Status',bg=PANEL,fg=GOLD,font=FONT_H2).pack(anchor='w',padx=14,pady=(14,8))
+        txt=f"Restore Point: {'Enabled' if self.restore_var.get() else 'Disabled'}\nBackup Vault: {'Enabled' if self.vault_var.get() else 'Disabled'}\nVault Path: {VAULT_ROOT}"
+        tk.Label(info,text=txt,bg=PANEL,fg=TEXT_DIM,font=FONT_UI,justify='left').pack(anchor='w',padx=14,pady=(0,14))
 
     def show_programs(self):
-        self.set_page("Programs")
-        self.page_title(self.content, "Programs", "Find installed apps, run uninstallers, and queue leftovers for safe cleanup.")
-        main = tk.Frame(self.content, bg=BG); main.pack(fill="both", expand=True)
-        left = self.card(main, side="left", fill="both", expand=True, padx=(0,6))
-        right = self.card(main, side="left", fill="both", expand=True, padx=(6,0))
-        top = tk.Frame(left, bg=PANEL); top.pack(fill="x", padx=12, pady=12)
-        tk.Label(top, text="Installed Applications", bg=PANEL, fg=GOLD, font=FONT_H2).pack(side="left")
-        self.count_label = tk.Label(top, text=f"{len(self.programs)} found", bg=PANEL, fg=TEXT_DIM, font=FONT_SMALL); self.count_label.pack(side="right")
-        self.search_var = tk.StringVar()
-        self.search_var.trace_add("write", lambda *_: self.populate_programs())
-        e = tk.Entry(left, textvariable=self.search_var, bg=INPUT, fg=TEXT, insertbackground=CYAN, relief="flat", highlightthickness=1, highlightbackground=BORDER_DIM, font=FONT_UI)
-        e.pack(fill="x", padx=12, pady=(0,10), ipady=8)
-        wrap = tk.Frame(left, bg=BG_2, highlightbackground=BORDER_DIM, highlightthickness=1); wrap.pack(fill="both", expand=True, padx=12, pady=(0,10))
-        self.listbox = tk.Listbox(wrap, bg=BG_2, fg=TEXT, selectbackground=BLUE, selectforeground="white", font=FONT_UI, bd=0, highlightthickness=0, selectmode="extended", exportselection=False)
-        self.listbox.pack(side="left", fill="both", expand=True, padx=6, pady=6)
-        sb=ttk.Scrollbar(wrap, command=self.listbox.yview); sb.pack(side="right", fill="y"); self.listbox.configure(yscrollcommand=sb.set)
-        self.listbox.bind("<<ListboxSelect>>", lambda _e: self.update_details())
-        self.listbox.bind("<Double-Button-1>", lambda _e: self.scan_selected())
-        controls = tk.Frame(left,bg=PANEL); controls.pack(fill="x", padx=12, pady=(0,12))
-        self.button(controls,"Scan Selected",self.scan_selected,bg=GREEN,fg=BG).pack(side="left", padx=(0,6))
-        self.button(controls,"Queue Selected",self.queue_selected_programs).pack(side="left", padx=6)
-        self.button(controls,"Official Uninstaller",self.run_official).pack(side="left", padx=6)
-        self.detail_text = tk.Label(right, text="Select a program to view details.", bg=PANEL, fg=TEXT_DIM, font=FONT_UI, justify="left", anchor="w", wraplength=470)
-        tk.Label(right, text="Target Details", bg=PANEL, fg=GOLD, font=FONT_H2).pack(anchor="w", padx=12, pady=(12,4))
-        self.detail_text.pack(fill="x", padx=12, pady=(0,8))
-        self.build_queue(right)
-        self.populate_programs()
+        self.set_page('Programs'); self.title_block('Programs','Find installed apps, scan leftovers, and clean reviewed files safely.')
+        main=tk.Frame(self.content,bg=BG); main.pack(fill='both',expand=True)
+        left=self.card(main,side='left',fill='both',expand=True,padx=(0,6)); right=self.card(main,side='left',fill='both',expand=True,padx=(6,0))
+        top=tk.Frame(left,bg=PANEL); top.pack(fill='x',padx=12,pady=12)
+        tk.Label(top,text='Installed Applications',bg=PANEL,fg=GOLD,font=FONT_H2).pack(side='left'); self.count_lbl=tk.Label(top,text='0 found',bg=PANEL,fg=TEXT_DIM,font=FONT_SMALL); self.count_lbl.pack(side='right')
+        self.search_var=tk.StringVar(); self.search_var.trace_add('write',lambda *_: self.populate_programs())
+        tk.Entry(left,textvariable=self.search_var,bg=INPUT,fg=TEXT,insertbackground=CYAN,relief='flat',highlightthickness=1,highlightbackground=BORDER,font=FONT_UI).pack(fill='x',padx=12,pady=(0,10),ipady=8)
+        wrap=tk.Frame(left,bg=BG_2,highlightbackground=BORDER,highlightthickness=1); wrap.pack(fill='both',expand=True,padx=12,pady=(0,10))
+        self.listbox=tk.Listbox(wrap,bg=BG_2,fg=TEXT,selectbackground=BLUE,selectforeground='white',font=FONT_UI,bd=0,highlightthickness=0,exportselection=False)
+        self.listbox.pack(side='left',fill='both',expand=True,padx=6,pady=6); sb=ttk.Scrollbar(wrap,command=self.listbox.yview); sb.pack(side='right',fill='y'); self.listbox.configure(yscrollcommand=sb.set)
+        self.listbox.bind('<<ListboxSelect>>',lambda _e:self.update_details()); self.listbox.bind('<Double-Button-1>',lambda _e:self.scan_selected())
+        ctl=tk.Frame(left,bg=PANEL); ctl.pack(fill='x',padx=12,pady=(0,12)); self.btn(ctl,'Scan Selected',self.scan_selected,GREEN,BG).pack(side='left',padx=(0,6)); self.btn(ctl,'Official Uninstaller',self.run_official).pack(side='left',padx=6)
+        tk.Label(right,text='Target Details',bg=PANEL,fg=GOLD,font=FONT_H2).pack(anchor='w',padx=12,pady=(12,4))
+        self.details=tk.Label(right,text='Select a program to view details.',bg=PANEL,fg=TEXT_DIM,font=FONT_SMALL,justify='left',anchor='w',wraplength=470); self.details.pack(fill='x',padx=12,pady=(0,8))
+        self.build_queue(right); self.populate_programs()
 
-    def build_queue(self, parent):
-        head = tk.Frame(parent,bg=PANEL); head.pack(fill="x", padx=12, pady=(4,6))
-        tk.Label(head,text="Cleanup Queue",bg=PANEL,fg=GOLD,font=FONT_H2).pack(side="left")
-        self.queue_label=tk.Label(head,text="0 items",bg=PANEL,fg=TEXT_DIM,font=FONT_SMALL); self.queue_label.pack(side="right")
-        wrap=tk.Frame(parent,bg=BG_2,highlightbackground=BORDER_DIM,highlightthickness=1); wrap.pack(fill="both",expand=True,padx=12,pady=(0,8))
-        self.queue_canvas=tk.Canvas(wrap,bg=BG_2,highlightthickness=0); self.queue_canvas.pack(side="left",fill="both",expand=True)
-        self.items_frame=tk.Frame(self.queue_canvas,bg=BG_2); self.queue_window=self.queue_canvas.create_window((0,0),window=self.items_frame,anchor="nw")
-        sb=ttk.Scrollbar(wrap,command=self.queue_canvas.yview); sb.pack(side="right",fill="y"); self.queue_canvas.configure(yscrollcommand=sb.set)
-        self.items_frame.bind("<Configure>",lambda _e:self.queue_canvas.configure(scrollregion=self.queue_canvas.bbox("all")))
-        self.queue_canvas.bind("<Configure>",lambda e:self.queue_canvas.itemconfigure(self.queue_window,width=e.width))
-        self.empty_queue("Scan a program or run Hunter to add cleanup items.")
-        qc=tk.Frame(parent,bg=PANEL); qc.pack(fill="x",padx=12,pady=(0,8))
-        self.button(qc,"Select All",lambda:self.toggle_all(True)).pack(side="left",padx=(0,5))
-        self.button(qc,"Clear Checks",lambda:self.toggle_all(False)).pack(side="left",padx=5)
-        self.button(qc,"Add File",self.add_file).pack(side="left",padx=5)
-        self.button(qc,"Add Folder",self.add_folder).pack(side="left",padx=5)
-        checks=tk.Frame(parent,bg=PANEL); checks.pack(fill="x",padx=12,pady=(0,8))
-        tk.Checkbutton(checks,text="Create Windows restore point before cleanup",variable=self.create_restore_var,bg=PANEL,fg=TEXT_DIM,activebackground=PANEL,activeforeground=TEXT,selectcolor=BG,font=FONT_SMALL).pack(anchor="w")
-        tk.Checkbutton(checks,text=f"Back up deleted files to vault",variable=self.backup_vault_var,bg=PANEL,fg=TEXT_DIM,activebackground=PANEL,activeforeground=TEXT,selectcolor=BG,font=FONT_SMALL).pack(anchor="w")
-        self.button(parent,"Clean Selected Safely",self.clean_selected,bg=RED,fg="white").pack(fill="x",padx=12,pady=(0,12))
+    def build_queue(self,parent):
+        head=tk.Frame(parent,bg=PANEL); head.pack(fill='x',padx=12,pady=(4,6)); tk.Label(head,text='Cleanup Queue',bg=PANEL,fg=GOLD,font=FONT_H2).pack(side='left'); self.queue_lbl=tk.Label(head,text='0 items',bg=PANEL,fg=TEXT_DIM,font=FONT_SMALL); self.queue_lbl.pack(side='right')
+        wrap=tk.Frame(parent,bg=BG_2,highlightbackground=BORDER,highlightthickness=1); wrap.pack(fill='both',expand=True,padx=12,pady=(0,8))
+        self.canvas=tk.Canvas(wrap,bg=BG_2,highlightthickness=0); self.canvas.pack(side='left',fill='both',expand=True); self.items_frame=tk.Frame(self.canvas,bg=BG_2); self.item_window=self.canvas.create_window((0,0),window=self.items_frame,anchor='nw')
+        sb=ttk.Scrollbar(wrap,command=self.canvas.yview); sb.pack(side='right',fill='y'); self.canvas.configure(yscrollcommand=sb.set); self.items_frame.bind('<Configure>',lambda _e:self.canvas.configure(scrollregion=self.canvas.bbox('all'))); self.canvas.bind('<Configure>',lambda e:self.canvas.itemconfigure(self.item_window,width=e.width))
+        self.queue=[]; self.queue_widgets={}; self.empty_queue('Scan or add items to start.')
+        qctl=tk.Frame(parent,bg=PANEL); qctl.pack(fill='x',padx=12,pady=(0,8)); self.btn(qctl,'Select All',lambda:self.toggle_all(True)).pack(side='left',padx=(0,5)); self.btn(qctl,'Clear Checks',lambda:self.toggle_all(False)).pack(side='left',padx=5); self.btn(qctl,'Add File',self.add_file).pack(side='left',padx=5); self.btn(qctl,'Add Folder',self.add_folder).pack(side='left',padx=5)
+        safety=tk.Frame(parent,bg=PANEL); safety.pack(fill='x',padx=12,pady=(0,8)); tk.Checkbutton(safety,text='Create Windows restore point before cleanup',variable=self.restore_var,bg=PANEL,fg=TEXT_DIM,activebackground=PANEL,activeforeground=TEXT,selectcolor=BG,font=FONT_SMALL).pack(anchor='w'); tk.Checkbutton(safety,text=f'Back up files to vault: {VAULT_ROOT}',variable=self.vault_var,bg=PANEL,fg=TEXT_DIM,activebackground=PANEL,activeforeground=TEXT,selectcolor=BG,font=FONT_SMALL).pack(anchor='w')
+        self.btn(parent,'Clean Selected Safely',self.clean_selected,RED,'white').pack(fill='x',padx=12,pady=(0,12))
 
-    def show_hunter(self):
-        self.set_page("Hunter")
-        self.page_title(self.content, "Hunter", "Scan common junk and leftover locations. Review all results before cleanup.")
-        top = self.card(self.content, fill="x")
-        tk.Label(top, text="Hunter Tools", bg=PANEL, fg=GOLD, font=FONT_H2).pack(anchor="w", padx=14, pady=(14,8))
-        row=tk.Frame(top,bg=PANEL); row.pack(fill="x",padx=14,pady=(0,14))
-        self.button(row,"Temp Hunter",self.scan_temp_junk,bg=GREEN,fg=BG).pack(side="left",padx=(0,8))
-        self.hunter_query=tk.StringVar()
-        tk.Entry(row,textvariable=self.hunter_query,bg=INPUT,fg=TEXT,insertbackground=CYAN,relief="flat",highlightthickness=1,highlightbackground=BORDER_DIM,font=FONT_UI).pack(side="left",fill="x",expand=True,ipady=8,padx=8)
-        self.button(row,"Deep Leftover Search",self.deep_hunter_from_page).pack(side="left",padx=8)
-        qcard=self.card(self.content,fill="both",expand=True,pady=(12,0))
-        self.build_queue(qcard)
-
-    def show_vault(self):
-        self.set_page("Vault")
-        self.page_title(self.content, "Backup Vault", "Browse and restore backup snapshots created before cleanup.")
-        bar=self.card(self.content,fill="x")
-        row=tk.Frame(bar,bg=PANEL); row.pack(fill="x",padx=14,pady=14)
-        self.button(row,"Refresh",self.show_vault).pack(side="left",padx=(0,8))
-        self.button(row,"Open Vault Folder",self.open_vault).pack(side="left",padx=8)
-        self.button(row,"Restore Latest",self.restore_latest).pack(side="left",padx=8)
-        frame=self.card(self.content,fill="both",expand=True,pady=(12,0))
-        cols=("created","items","size","path")
-        self.vault_tree=ttk.Treeview(frame,columns=cols,show="headings")
-        for col in cols:
-            self.vault_tree.heading(col,text=col.title()); self.vault_tree.column(col,width=160 if col!="path" else 500,anchor="w")
-        self.vault_tree.pack(side="left",fill="both",expand=True,padx=10,pady=10)
-        sb=ttk.Scrollbar(frame,command=self.vault_tree.yview); sb.pack(side="right",fill="y"); self.vault_tree.configure(yscrollcommand=sb.set)
-        for i,v in enumerate(self.get_vaults()):
-            meta=self.read_vault_meta(v); items=meta.get("items",[]); size=sum(int(x.get("size",0)) for x in items if isinstance(x,dict))
-            self.vault_tree.insert("","end",iid=str(i),values=(v.name,len(items),format_size(size),str(v)))
-        self.vault_tree.bind("<Double-Button-1>",lambda _e:self.restore_selected_vault())
-        self.button(frame,"Restore Selected Vault",self.restore_selected_vault,bg=GREEN,fg=BG).pack(side="bottom",fill="x",padx=10,pady=(0,10))
-
-    def show_history(self):
-        self.set_page("History")
-        self.page_title(self.content, "History", "Cleanup actions, backups, restore attempts, and exported reports.")
-        bar=self.card(self.content,fill="x")
-        row=tk.Frame(bar,bg=PANEL); row.pack(fill="x",padx=14,pady=14)
-        self.button(row,"Refresh",self.show_history).pack(side="left",padx=(0,8))
-        self.button(row,"Export Report",self.export_report).pack(side="left",padx=8)
-        frame=self.card(self.content,fill="both",expand=True,pady=(12,0))
-        cols=("time","action","status","details")
-        tree=ttk.Treeview(frame,columns=cols,show="headings")
-        for col in cols:
-            tree.heading(col,text=col.title()); tree.column(col,width=170 if col!="details" else 540,anchor="w")
-        tree.pack(fill="both",expand=True,padx=10,pady=10)
-        for e in read_history(500):
-            details="; ".join(f"{k}={v}" for k,v in e.items() if k not in ("time","action","status"))
-            tree.insert("","end",values=(e.get("time",""),e.get("action",""),e.get("status",""),details))
-
-    def show_settings(self):
-        self.set_page("Settings")
-        self.page_title(self.content,"Settings","Safety defaults and app folders.")
-        f=self.card(self.content,fill="x")
-        tk.Checkbutton(f,text="Create Windows restore point before cleanup",variable=self.create_restore_var,bg=PANEL,fg=TEXT,activebackground=PANEL,activeforeground=TEXT,selectcolor=BG,font=FONT_UI).pack(anchor="w",padx=14,pady=(14,6))
-        tk.Checkbutton(f,text="Back up files to Backup Vault before deletion",variable=self.backup_vault_var,bg=PANEL,fg=TEXT,activebackground=PANEL,activeforeground=TEXT,selectcolor=BG,font=FONT_UI).pack(anchor="w",padx=14,pady=6)
-        tk.Label(f,text=f"App data: {APP_DIR}\nVault: {VAULT_ROOT}",bg=PANEL,fg=TEXT_DIM,font=FONT_SMALL,justify="left").pack(anchor="w",padx=14,pady=(6,14))
-        self.button(f,"Save Settings",self.save_settings,bg=GREEN,fg=BG).pack(anchor="w",padx=14,pady=(0,14))
-
-    # Program logic
-    def refresh_programs(self):
-        self._log("Scanning installed programs...", GOLD)
-        def work():
-            progs=discover_programs()
-            self.after(0,lambda:self.finish_refresh(progs))
-        threading.Thread(target=work,daemon=True).start()
-
-    def finish_refresh(self, progs):
-        self.programs=progs
-        self._log(f"Found {len(progs)} installed programs.", GREEN)
-        if self.active_page=="Programs": self.populate_programs()
-        if self.active_page=="Dashboard": self.show_dashboard()
-
-    def populate_programs(self):
-        if not hasattr(self,"listbox"): return
-        flt=self.search_var.get().lower() if hasattr(self,"search_var") else ""
-        self.filtered=[p for p in self.programs if flt in p.name.lower()]
-        self.listbox.delete(0,"end")
-        for p in self.filtered:
-            self.listbox.insert("end", p.name + (f"  ({p.version})" if p.version else ""))
-        self.count_label.configure(text=f"{len(self.filtered)} shown / {len(self.programs)} total")
-
-    def selected_programs(self):
-        if not hasattr(self,"listbox"): return []
-        return [self.filtered[i] for i in self.listbox.curselection() if i < len(self.filtered)]
-
-    def update_details(self):
-        ps=self.selected_programs()
-        if not ps:
-            self.detail_text.configure(text="Select a program to view details."); return
-        p=ps[0]
-        self.detail_text.configure(text=f"Name: {p.name}\nVersion: {p.version or 'Unknown'}\nLocation: {p.location or 'Unknown'}\nSource: {p.source}\nUninstaller: {p.uninstall or 'Not listed'}")
-
-    def scan_selected(self):
-        ps=self.selected_programs()
-        if not ps:
-            messagebox.showinfo(APP_NAME,"Select a program first."); return
-        p=ps[0]
-        self._log(f"Scanning leftovers for {p.name}...", GOLD)
-        def work():
-            paths=scan_associated_paths(p, deep=False)
-            self.after(0,lambda:self.render_queue(paths, f"Scan found {len(paths)} item(s)."))
-        threading.Thread(target=work,daemon=True).start()
-
-    def queue_selected_programs(self):
-        ps=self.selected_programs()
-        if not ps:
-            messagebox.showinfo(APP_NAME,"Select one or more programs first."); return
-        self._log(f"Queue scanning {len(ps)} program(s)...", GOLD)
-        def work():
-            paths=[]
-            for p in ps: paths.extend(scan_associated_paths(p, deep=False))
-            # unique
-            seen=[]
-            for x in paths:
-                if x not in seen: seen.append(x)
-            self.after(0,lambda:self.render_queue(seen, f"Queued {len(seen)} item(s)."))
-        threading.Thread(target=work,daemon=True).start()
-
-    def empty_queue(self, msg):
-        if not hasattr(self,"items_frame"): return
+    def empty_queue(self,msg):
         for w in self.items_frame.winfo_children(): w.destroy()
-        self.scan_items=[]
-        tk.Label(self.items_frame,text=msg,bg=BG_2,fg=TEXT_DIM,font=FONT_UI,justify="left").pack(anchor="w",padx=12,pady=12)
-        if hasattr(self,"queue_label"): self.queue_label.configure(text="0 items")
-
-    def render_queue(self, paths, msg=""):
+        self.queue=[]; self.queue_widgets={}; self.queue_lbl.configure(text='0 items')
+        tk.Label(self.items_frame,text=msg,bg=BG_2,fg=TEXT_DIM,font=FONT_UI,justify='center').pack(expand=True,fill='both',padx=18,pady=32)
+    def render_queue(self,paths,msg='Queued items.'):
         for w in self.items_frame.winfo_children(): w.destroy()
-        self.scan_items=[]
-        if not paths:
-            self.empty_queue("No cleanup items found."); self._log("No items found.", ORANGE); return
+        self.queue=[]; self.queue_widgets={}
+        if not paths: self.empty_queue('No cleanup items found.'); self.log_msg('No items found.',ORANGE); return
         total=0
         for p in paths:
-            sz=path_size(p); total+=sz; self.add_queue_row(p, sz)
-        self.queue_label.configure(text=f"{len(paths)} items • {format_size(total)}")
-        self._log(msg or f"Queued {len(paths)} item(s).", GREEN)
-
-    def add_queue_row(self,path,sz=None):
-        if sz is None: sz=path_size(path)
+            if not Path(p).exists(): continue
+            sz=path_size(p); total+=sz; self.add_row(p,sz)
+        self.refresh_queue_label(); self.log_msg(msg,GREEN)
+    def add_row(self,path,sz=None):
+        if not hasattr(self,'items_frame'): return
+        if not hasattr(self,'queue_widgets'): self.queue_widgets={}
+        sz=path_size(path) if sz is None else sz
         var=tk.BooleanVar(value=True)
-        row=tk.Frame(self.items_frame,bg=BG_2,highlightbackground=BORDER_DIM,highlightthickness=1)
-        row.pack(fill="x",padx=8,pady=4)
-        tk.Checkbutton(row,variable=var,bg=BG_2,activebackground=BG_2,selectcolor=BG).pack(side="left",padx=8)
-        icon="Folder" if Path(path).is_dir() else "File"
-        tk.Label(row,text=f"{icon}  {path}\n{format_size(sz)}",bg=BG_2,fg=TEXT,font=FONT_SMALL,justify="left",anchor="w").pack(side="left",fill="x",expand=True,pady=7)
-        self.scan_items.append((path,var,sz))
-
+        row=tk.Frame(self.items_frame,bg=BG_2,highlightbackground=BORDER,highlightthickness=1)
+        row.pack(fill='x',padx=8,pady=5)
+        cb=tk.Checkbutton(row,variable=var,bg=BG_2,activebackground=BG_2,fg=TEXT,activeforeground=TEXT,selectcolor=GREEN,font=FONT_SMALL,command=self.refresh_queue_label)
+        cb.pack(side='left',padx=(8,4),pady=8)
+        icon='Folder' if Path(path).is_dir() else 'File'
+        tk.Label(row,text=f"{icon}  {path}\n{format_size(sz)}",bg=BG_2,fg=TEXT,font=FONT_SMALL,justify='left',anchor='w').pack(side='left',fill='x',expand=True,pady=7)
+        self.queue.append((path,var,sz))
+        self.queue_widgets[path]=cb
+        self.refresh_queue_label()
+    def refresh_queue_label(self):
+        if not hasattr(self,'queue_lbl') or not hasattr(self,'queue'): return
+        total=sum(sz for _p,_v,sz in self.queue)
+        selected=sum(1 for _p,v,_s in self.queue if v.get())
+        self.queue_lbl.configure(text=f"{selected}/{len(self.queue)} selected • {format_size(total)}" if self.queue else '0 items')
     def toggle_all(self,state):
-        for _p,v,_s in self.scan_items: v.set(state)
-
+        if not hasattr(self,'queue') or not self.queue:
+            self.log_msg('No cleanup items are currently queued.', ORANGE)
+            return
+        for _p,v,_s in self.queue:
+            v.set(bool(state))
+        self.refresh_queue_label()
+        self.update_idletasks()
+        self.log_msg(('Selected all' if state else 'Cleared checks') + f' ({len(self.queue)} item(s)).', CYAN)
     def add_file(self):
-        p=filedialog.askopenfilename(title="Add file to cleanup queue")
-        if p: self.add_queue_row(p); self.queue_label.configure(text=f"{len(self.scan_items)} items")
+        p=filedialog.askopenfilename(title='Add file to cleanup queue')
+        if p: self.add_row(p); self.refresh_queue_label()
     def add_folder(self):
-        p=filedialog.askdirectory(title="Add folder to cleanup queue")
-        if p: self.add_queue_row(p); self.queue_label.configure(text=f"{len(self.scan_items)} items")
+        p=filedialog.askdirectory(title='Add folder to cleanup queue')
+        if p: self.add_row(p); self.refresh_queue_label()
+
+    def populate_programs(self):
+        if not hasattr(self,'listbox'): return
+        q=self.search_var.get().lower() if hasattr(self,'search_var') else ''
+        self.filtered=[p for p in self.programs if q in p.name.lower() or q in p.publisher.lower()]
+        self.listbox.delete(0,'end')
+        for p in self.filtered: self.listbox.insert('end', p.row())
+        self.count_lbl.configure(text=f'{len(self.filtered)} shown / {len(self.programs)} found')
+    def selected_program(self):
+        if not hasattr(self,'listbox'): return None
+        sel=self.listbox.curselection(); return self.filtered[sel[0]] if sel and sel[0] < len(self.filtered) else None
+    def update_details(self):
+        p=self.selected_program()
+        if not p: self.details.configure(text='Select a program to view details.'); return
+        self.details.configure(text=f"Name: {p.name}\nVersion: {p.version or 'Unknown'}\nPublisher: {p.publisher or 'Unknown'}\nLocation: {p.location or 'Unknown'}\nSource: {p.source}\nUninstaller: {'available' if p.uninstall else 'not listed'}")
+    def scan_selected(self):
+        p=self.selected_program()
+        if not p: messagebox.showinfo(APP_NAME,'Select a program first.'); return
+        self.update_details(); self.log_msg(f'Scanning leftovers for {p.name}...',GOLD)
+        def work():
+            paths=scan_associated_paths(p,False); self.after(0,lambda:self.render_queue(paths,f'Found {len(paths)} possible leftover item(s).'))
+        threading.Thread(target=work,daemon=True).start()
+    def run_official(self):
+        p=self.selected_program()
+        if not p: messagebox.showinfo(APP_NAME,'Select a program first.'); return
+        if not p.uninstall: messagebox.showinfo(APP_NAME,'No official uninstaller is listed for this app.'); return
+        if messagebox.askyesno(APP_NAME,f'Run official uninstaller?\n\n{p.uninstall}'):
+            try: subprocess.Popen(p.uninstall, shell=True); history({'action':'official_uninstaller','status':'launched','program':p.name}); self.log_msg('Official uninstaller launched.',GREEN)
+            except Exception as exc: messagebox.showerror(APP_NAME,str(exc)); self.log_msg(str(exc),RED)
+
+    def show_hunter(self):
+        self.set_page('Hunter'); self.title_block('Hunter','Scan temp locations or search common leftover folders.')
+        top=self.card(self.content,fill='x'); tk.Label(top,text='Hunter Tools',bg=PANEL,fg=GOLD,font=FONT_H2).pack(anchor='w',padx=14,pady=(14,8))
+        row=tk.Frame(top,bg=PANEL); row.pack(fill='x',padx=14,pady=(0,14)); self.btn(row,'Temp Hunter',self.scan_temp_junk,GREEN,BG).pack(side='left',padx=(0,8)); self.hunter_query=tk.StringVar(); tk.Entry(row,textvariable=self.hunter_query,bg=INPUT,fg=TEXT,insertbackground=CYAN,relief='flat',highlightthickness=1,highlightbackground=BORDER,font=FONT_UI).pack(side='left',fill='x',expand=True,ipady=8,padx=8); self.btn(row,'Deep Search',self.deep_search).pack(side='left',padx=8)
+        q=self.card(self.content,fill='both',expand=True,pady=(12,0)); self.build_queue(q)
+    def scan_temp_junk(self):
+        if self.current_page != 'Hunter': self.show_hunter()
+        self.log_msg('Temp Hunter scanning...',GOLD)
+        def work():
+            paths=temp_items(); self.after(0,lambda:self.render_queue(paths,f'Temp Hunter found {len(paths)} item(s).'))
+        threading.Thread(target=work,daemon=True).start()
+    def deep_search(self):
+        q=self.hunter_query.get().strip()
+        if not q: messagebox.showinfo(APP_NAME,'Type an app or folder name to deep search.'); return
+        self.log_msg(f'Deep Search scanning for {q}...',GOLD)
+        def work():
+            paths=scan_associated_paths(q,True,int(self.deep_limit_var.get() or 3000)); self.after(0,lambda:self.render_queue(paths,f'Deep Search found {len(paths)} item(s).'))
+        threading.Thread(target=work,daemon=True).start()
 
     def clean_selected(self):
-        targets=[p for p,v,_s in self.scan_items if v.get() and Path(p).exists()]
-        if not targets:
-            messagebox.showinfo(APP_NAME,"No checked existing items to clean."); return
+        targets=[p for p,v,_s in self.queue if v.get() and Path(p).exists()]
+        if not targets: messagebox.showinfo(APP_NAME,'No checked existing items to clean.'); return
         total=sum(path_size(p) for p in targets)
-        if not messagebox.askyesno(APP_NAME, f"Clean {len(targets)} item(s)?\nEstimated size: {format_size(total)}\n\nBackup Vault: {'ON' if self.backup_vault_var.get() else 'OFF'}\nRestore Point: {'ON' if self.create_restore_var.get() else 'OFF'}"):
-            return
-        if self.create_restore_var.get() and IS_WINDOWS:
-            ok,msg=create_restore_point("System Warden cleanup")
-            self._log(msg, GREEN if ok else ORANGE)
-            append_history({"action":"restore_point","status":"ok" if ok else "failed","details":msg})
-        vault=None
-        if self.backup_vault_var.get():
-            vault,msg=backup_paths(targets); self._log(msg,GREEN); append_history({"action":"backup","status":"ok","vault":str(vault)})
-        ok=fail=0
-        for p in targets:
-            success,msg=delete_path(p); ok+=int(success); fail+=int(not success); self._log(msg, GREEN if success else RED)
-        append_history({"action":"cleanup","status":"ok" if fail==0 else "partial","removed":ok,"failed":fail,"vault":str(vault) if vault else ""})
-        self.render_queue([p for p,_,_ in self.scan_items if Path(p).exists()], f"Cleanup complete. Removed {ok}, failed {fail}.")
-
-    def scan_temp_junk(self):
-        if self.active_page not in ("Hunter","Programs"):
-            self.show_hunter()
-        self._log("Temp Hunter scanning...", GOLD)
+        if not messagebox.askyesno(APP_NAME,f'Clean {len(targets)} item(s)?\nEstimated size: {format_size(total)}\n\nBackup Vault: {"ON" if self.vault_var.get() else "OFF"}\nRestore Point: {"ON" if self.restore_var.get() else "OFF"}') : return
+        self.btn_disable_notice=True; self.log_msg('Cleanup started...',GOLD)
         def work():
-            paths=get_temp_items()
-            self.after(0,lambda:self.render_queue(paths, f"Temp Hunter found {len(paths)} item(s)."))
+            rp_msg=''; rp_ok=False; vault=None; backup_msg=''
+            if self.restore_var.get() and IS_WINDOWS:
+                rp_ok,rp_msg=create_restore_point(); history({'action':'restore_point','status':'ok' if rp_ok else 'skipped','details':rp_msg})
+            if self.vault_var.get():
+                vault,backup_msg=backup_paths(targets); history({'action':'backup','status':'ok','vault':str(vault)})
+            results=[]; ok=fail=0
+            for t in targets:
+                s,m=delete_path(t); ok+=int(s); fail+=int(not s); results.append((s,m))
+            history({'action':'cleanup','status':'ok' if fail==0 else 'partial','removed':ok,'failed':fail,'vault':str(vault) if vault else ''})
+            self.after(0,lambda:self.finish_cleanup(rp_ok,rp_msg,backup_msg,results,ok,fail))
         threading.Thread(target=work,daemon=True).start()
+    def finish_cleanup(self,rp_ok,rp_msg,backup_msg,results,ok,fail):
+        if rp_msg: self.log_msg(rp_msg, GREEN if rp_ok else ORANGE)
+        if backup_msg: self.log_msg(backup_msg,GREEN)
+        for s,m in results: self.log_msg(m, GREEN if s else RED)
+        remain=[p for p,_,_ in self.queue if Path(p).exists()]
+        self.render_queue(remain,f'Cleanup complete. Removed {ok}, failed {fail}.')
+        if self.current_page=='Dashboard': self.show_dashboard()
 
-    def deep_hunter_from_page(self):
-        q=self.hunter_query.get().strip()
-        if not q:
-            messagebox.showinfo(APP_NAME,"Type an app or folder name to deep search."); return
-        self.deep_hunter(q)
-
-    def deep_hunter(self, query: str):
-        fake=Program(query)
-        self._log(f"Deep Hunter scanning for {query}...", GOLD)
-        def work():
-            paths=scan_associated_paths(fake,deep=True,limit=int(self.settings.get("deep_scan_limit",1500)))
-            self.after(0,lambda:self.render_queue(paths, f"Deep Hunter found {len(paths)} item(s)."))
-        threading.Thread(target=work,daemon=True).start()
-
-    def run_official(self):
-        ps=self.selected_programs()
-        if not ps: messagebox.showinfo(APP_NAME,"Select a program first."); return
-        cmd=ps[0].uninstall
-        if not cmd: messagebox.showinfo(APP_NAME,"No official uninstaller is listed for this app."); return
-        if not messagebox.askyesno(APP_NAME,f"Run official uninstaller?\n\n{cmd}"): return
-        try:
-            subprocess.Popen(cmd, shell=True)
-            append_history({"action":"official_uninstaller","status":"launched","program":ps[0].name})
-            self._log("Official uninstaller launched.", GREEN)
-        except Exception as exc:
-            messagebox.showerror(APP_NAME,str(exc)); self._log(str(exc),RED)
-
-    # Vault/history helpers
-    def get_vaults(self):
-        ensure_dirs(); return sorted([p for p in VAULT_ROOT.iterdir() if p.is_dir()], reverse=True)
-    def read_vault_meta(self,v):
-        try: return json.loads((v/"metadata.json").read_text(encoding="utf-8"))
-        except Exception: return {"items":[]}
+    def show_vault(self):
+        self.set_page('Vault'); self.title_block('Backup Vault','Browse and restore backup snapshots.')
+        bar=self.card(self.content,fill='x'); r=tk.Frame(bar,bg=PANEL); r.pack(fill='x',padx=14,pady=14); self.btn(r,'Refresh',self.show_vault).pack(side='left',padx=(0,8)); self.btn(r,'Open Vault Folder',self.open_vault).pack(side='left',padx=8); self.btn(r,'Restore Latest',self.restore_latest).pack(side='left',padx=8)
+        frame=self.card(self.content,fill='both',expand=True,pady=(12,0)); cols=('created','items','size','path'); self.vault_tree=ttk.Treeview(frame,columns=cols,show='headings')
+        for c in cols: self.vault_tree.heading(c,text=c.title()); self.vault_tree.column(c,width=170 if c!='path' else 520,anchor='w')
+        self.vault_tree.pack(side='left',fill='both',expand=True,padx=10,pady=10); sb=ttk.Scrollbar(frame,command=self.vault_tree.yview); sb.pack(side='right',fill='y'); self.vault_tree.configure(yscrollcommand=sb.set)
+        for i,v in enumerate(self.get_vaults()):
+            meta=self.vault_meta(v); items=meta.get('items',[]); size=sum(int(x.get('size',0)) for x in items if isinstance(x,dict)); self.vault_tree.insert('', 'end', iid=str(i), values=(v.name,len(items),format_size(size),str(v)))
+        self.vault_tree.bind('<Double-Button-1>',lambda _e:self.restore_selected())
+        self.btn(frame,'Restore Selected Vault',self.restore_selected,GREEN,BG).pack(side='bottom',fill='x',padx=10,pady=(0,10))
+    def get_vaults(self): ensure_dirs(); return sorted([p for p in VAULT_ROOT.iterdir() if p.is_dir()], reverse=True)
+    def vault_meta(self,v):
+        try: return json.loads((v/'metadata.json').read_text(encoding='utf-8'))
+        except Exception: return {'items':[]}
     def open_vault(self):
         ensure_dirs()
-        try:
-            os.startfile(str(VAULT_ROOT)) if IS_WINDOWS else subprocess.Popen(["open" if IS_MAC else "xdg-open", str(VAULT_ROOT)])
+        try: os.startfile(str(VAULT_ROOT)) if IS_WINDOWS else subprocess.Popen(['open' if IS_MAC else 'xdg-open', str(VAULT_ROOT)])
         except Exception as exc: messagebox.showerror(APP_NAME,str(exc))
     def restore_latest(self):
-        vaults=self.get_vaults()
-        if not vaults: messagebox.showinfo(APP_NAME,"No vault backups found."); return
-        self.restore_vault_path(vaults[0])
-    def restore_selected_vault(self):
-        sel=self.vault_tree.selection() if hasattr(self,"vault_tree") else []
-        if not sel: messagebox.showinfo(APP_NAME,"Select a vault first."); return
-        vals=self.vault_tree.item(sel[0],"values"); self.restore_vault_path(Path(vals[3]))
-    def restore_vault_path(self,vault):
-        if not messagebox.askyesno(APP_NAME,f"Restore missing files from this vault?\nExisting files will not be overwritten.\n\n{vault}"): return
-        ok,fail,notes=restore_vault(Path(vault))
-        append_history({"action":"restore_vault","status":"ok" if fail==0 else "partial","vault":str(vault),"restored":ok,"failed":fail})
-        self._log(f"Vault restore complete: {ok} restored, {fail} failed/skipped.", GREEN if fail==0 else ORANGE)
-        if notes: messagebox.showinfo(APP_NAME,"\n".join(notes[:20]))
+        v=self.get_vaults()
+        if not v: messagebox.showinfo(APP_NAME,'No vault backups found.'); return
+        self.restore_path(v[0])
+    def restore_selected(self):
+        sel=self.vault_tree.selection() if hasattr(self,'vault_tree') else []
+        if not sel: messagebox.showinfo(APP_NAME,'Select a vault first.'); return
+        self.restore_path(Path(self.vault_tree.item(sel[0],'values')[3]))
+    def restore_path(self,vault):
+        if not messagebox.askyesno(APP_NAME,f'Restore missing files from this vault?\nExisting files will not be overwritten.\n\n{vault}'): return
+        ok,fail,notes=restore_vault(Path(vault)); history({'action':'restore_vault','status':'ok' if fail==0 else 'partial','vault':str(vault),'restored':ok,'failed':fail}); self.log_msg(f'Vault restore complete: {ok} restored, {fail} failed/skipped.',GREEN if fail==0 else ORANGE)
+        if notes: messagebox.showinfo(APP_NAME,'\n'.join(notes[:20]))
+
+    def show_history(self):
+        self.set_page('History'); self.title_block('History','Cleanup actions, backups, restore attempts, and reports.')
+        bar=self.card(self.content,fill='x'); r=tk.Frame(bar,bg=PANEL); r.pack(fill='x',padx=14,pady=14); self.btn(r,'Refresh',self.show_history).pack(side='left',padx=(0,8)); self.btn(r,'Export Report',self.export_report).pack(side='left',padx=8)
+        frame=self.card(self.content,fill='both',expand=True,pady=(12,0)); cols=('time','action','status','details'); tree=ttk.Treeview(frame,columns=cols,show='headings')
+        for c in cols: tree.heading(c,text=c.title()); tree.column(c,width=170 if c!='details' else 560,anchor='w')
+        tree.pack(fill='both',expand=True,padx=10,pady=10)
+        for e in read_history(500): tree.insert('', 'end', values=(e.get('time',''), e.get('action',''), e.get('status',''), '; '.join(f'{k}={v}' for k,v in e.items() if k not in ('time','action','status'))))
     def export_report(self):
-        p=filedialog.asksaveasfilename(title="Export report", defaultextension=".txt", filetypes=[("Text","*.txt")])
+        p=filedialog.asksaveasfilename(title='Export report',defaultextension='.txt',filetypes=[('Text','*.txt')])
         if not p: return
-        lines=[f"{APP_NAME} Report",f"Generated: {datetime.now().isoformat(timespec='seconds')}",f"App dir: {APP_DIR}",f"Vault: {VAULT_ROOT}","","History:"]
-        for e in read_history(500): lines.append(json.dumps(e,ensure_ascii=False))
-        Path(p).write_text("\n".join(lines),encoding="utf-8")
-        append_history({"action":"export_report","status":"ok","path":p})
-        self._log(f"Report exported: {p}",GREEN)
+        lines=[f'{APP_NAME} Report',f'Generated: {datetime.now().isoformat(timespec="seconds")}',f'App dir: {APP_DIR}',f'Vault: {VAULT_ROOT}','','History:']+[json.dumps(e,ensure_ascii=False) for e in read_history(500)]
+        Path(p).write_text('\n'.join(lines),encoding='utf-8'); history({'action':'export_report','status':'ok','path':p}); self.log_msg(f'Report exported: {p}',GREEN)
+
+    def show_settings(self):
+        self.set_page('Settings'); self.title_block('Settings','Safety defaults and app folders.')
+        f=self.card(self.content,fill='x')
+        tk.Checkbutton(f,text='Create Windows restore point before cleanup',variable=self.restore_var,bg=PANEL,fg=TEXT,activebackground=PANEL,activeforeground=TEXT,selectcolor=BG,font=FONT_UI).pack(anchor='w',padx=14,pady=(14,6))
+        tk.Checkbutton(f,text='Back up files to Backup Vault before deletion',variable=self.vault_var,bg=PANEL,fg=TEXT,activebackground=PANEL,activeforeground=TEXT,selectcolor=BG,font=FONT_UI).pack(anchor='w',padx=14,pady=6)
+        tk.Label(f,text='Deep scan item limit',bg=PANEL,fg=TEXT_DIM,font=FONT_SMALL).pack(anchor='w',padx=14,pady=(10,2)); tk.Entry(f,textvariable=self.deep_limit_var,bg=INPUT,fg=TEXT,insertbackground=CYAN,relief='flat',highlightthickness=1,highlightbackground=BORDER,font=FONT_UI,width=12).pack(anchor='w',padx=14,ipady=5)
+        tk.Label(f,text=f'App data: {APP_DIR}\nVault: {VAULT_ROOT}',bg=PANEL,fg=TEXT_DIM,font=FONT_SMALL,justify='left').pack(anchor='w',padx=14,pady=(12,14)); self.btn(f,'Save Settings',self.save_settings,GREEN,BG).pack(anchor='w',padx=14,pady=(0,14))
     def save_settings(self):
-        self.settings.update({"create_restore_point":self.create_restore_var.get(),"backup_vault":self.backup_vault_var.get()})
-        save_settings(self.settings); self._log("Settings saved.",GREEN); self.show_dashboard()
+        try: limit=max(500,int(self.deep_limit_var.get()))
+        except Exception: limit=3000
+        self.settings.update({'restore_point':self.restore_var.get(),'backup_vault':self.vault_var.get(),'deep_limit':limit}); save_settings(self.settings); self.log_msg('Settings saved.',GREEN); self.show_dashboard()
     def show_safety(self):
-        messagebox.showinfo(APP_NAME,"Safety Notes\n\n• Keep Backup Vault enabled.\n• Restore point creation may require admin rights and System Protection enabled.\n• Deep Hunter can show false positives. Review every path before cleaning.\n• This app does not permanently delete backups unless you remove the vault folder.")
+        messagebox.showinfo(APP_NAME,'Safety Notes\n\n• Keep Backup Vault enabled.\n• Restore point creation requires admin rights and System Protection enabled.\n• Deep Search can show false positives. Review every path before cleanup.\n• Existing files are not overwritten during vault restore.')
 
+    def refresh_programs(self):
+        self.log_msg('Scanning installed programs...',GOLD)
+        def work():
+            try: progs=discover_programs(); self.after(0,lambda:self.finish_refresh(progs))
+            except Exception as exc: self.after(0,lambda:self.log_msg(f'Program scan failed: {exc}',RED))
+        threading.Thread(target=work,daemon=True).start()
+    def finish_refresh(self,progs):
+        self.programs=progs; self.log_msg(f'Found {len(progs)} installed programs.',GREEN)
+        if self.current_page=='Programs': self.populate_programs()
+        if self.current_page=='Dashboard': self.show_dashboard()
 
-def build_package():
-    pass
-
-
-def main():
-    ensure_dirs()
-    app=SystemWarden(); app.mainloop(); return 0
-
-if __name__ == "__main__":
-    raise SystemExit(main())
+def main(): ensure_dirs(); app=SystemWarden(); app.mainloop(); return 0
+if __name__ == '__main__': raise SystemExit(main())
